@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.cache/
+backtest_trades.csv
+sweep_out.txt

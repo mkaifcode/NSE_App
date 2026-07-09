@@ -19,7 +19,7 @@ from engine import (
     parallel_scan, get_nse_universe, fetch_ohlcv, fetch_ohlcv_checked,
     compute_indicators, score_stock, compute_levels,
     get_signal, analyse_holding, position_size, sessions_to_target,
-    DataError, WEIGHTS, MIN_SCORE, ALL_SECTORS, FALLBACK_UNIVERSE,
+    DataError, WEIGHTS, MIN_SCORE, FALLBACK_UNIVERSE,
     RISK_FRACTION, MODEL_DISCLAIMER, SCAN_PERIOD,
 )
 
@@ -39,7 +39,9 @@ st.set_page_config(
     page_title="NSE Trader Pro",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    # "auto" = expanded on desktop, collapsed on phones. "expanded" made the
+    # sidebar overlay the top nav on a 390px screen, covering the whole app.
+    initial_sidebar_state="auto",
 )
 
 # Meta tags go in their own call. Markdown ends a bare-tag HTML block at the
@@ -59,18 +61,41 @@ st.markdown("""<style>
 /* Hide the toolbar and footer, but NOT <header> itself — the sidebar
    expand arrow lives inside the header, and hiding it left a collapsed
    sidebar with no way to reopen. */
-#MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
-[data-testid="stToolbar"] { display: none !important; }
 [data-testid="stDecoration"] { display: none !important; }
-header[data-testid="stHeader"] { background: transparent !important; }
-[data-testid="collapsedControl"],
-[data-testid="stSidebarCollapsedControl"],
-[data-testid="stExpandSidebarButton"] {
-  display: flex !important; visibility: visible !important; z-index: 999;
+
+/* Do NOT hide stToolbar: the sidebar's expand arrow is rendered inside it.
+   Hiding the toolbar (or the whole <header>) is what left a collapsed sidebar
+   with no way to reopen — worst on touch screens, where Streamlit's hover-to-
+   reveal never fires. Hide only the toolbar's own actions. */
+[data-testid="stToolbar"] { display: flex !important; }
+[data-testid="stToolbarActions"],
+[data-testid="stAppDeployButton"],
+[data-testid="stStatusWidget"],
+[data-testid="stMainMenu"], #MainMenu { display: none !important; }
+
+/* The header is sticky and spans the full width. Left solid, its empty area
+   swallows clicks on whatever sits under it — which was the top nav. Make the
+   bar itself click-through, but keep its children (the expand arrow) clickable. */
+header[data-testid="stHeader"] {
+  background: transparent !important;
+  pointer-events: none;
 }
-.block-container { padding: 1.2rem 1.5rem 2rem !important; }
-@media(max-width:768px){ .block-container{ padding:0.6rem 0.6rem 2rem !important; } }
+header[data-testid="stHeader"] * { pointer-events: auto; }
+
+/* Always-on, never hover-gated. */
+[data-testid="stExpandSidebarButton"],
+[data-testid="stExpandSidebarButton"] button {
+  display: flex !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  width: auto !important; height: auto !important;
+  z-index: 1000;
+}
+
+/* Top padding must clear the sticky header, or the first widget hides beneath it. */
+.block-container { padding: 4.2rem 1.5rem 2rem !important; }
+@media(max-width:768px){ .block-container{ padding:3.4rem 0.6rem 2rem !important; } }
 
 /* ── Cards ── */
 .card {
@@ -150,6 +175,16 @@ def ss(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
 
+PAGES = [
+    "🏠 Home",
+    "🔍 Screener",
+    "📊 Chart",
+    "💼 Demat Analysis",
+    "⭐ Watchlist",
+    "📔 Trade Journal",
+]
+
+ss("nav",           PAGES[0])
 ss("scan_results",  [])
 ss("scan_stats",    None)
 ss("watchlist",     [])
@@ -163,6 +198,40 @@ ss("capital",       100000)
 # ══════════════════════════════════════════════════════════════
 #  SIDEBAR NAVIGATION
 # ══════════════════════════════════════════════════════════════
+def goto(p: str):
+    """Navigate from anywhere.
+
+    Writes the radio's own session key. Streamlit forbids this after the widget
+    is instantiated, but permits it inside a callback — which is why this is only
+    ever passed as `on_click`, never called inline.
+    """
+    st.session_state.nav = p
+
+
+# Navigation lives in the MAIN body, not the sidebar. Streamlit only reveals the
+# sidebar's expand arrow on header hover — which does not exist on touch screens,
+# so a collapsed sidebar used to strand the user with no way to navigate.
+#
+# The radio is bound by `key`, not by `index=`. With `index=` the widget keeps
+# its own retained value and silently ignores the index on rerun, so navigating
+# back to a previously-visited page did nothing.
+st.radio(
+    "Navigation", PAGES, key="nav",
+    horizontal=True, label_visibility="collapsed",
+)
+page = st.session_state.nav
+
+# Measured, not guessed: see backtest.py. 2010-2026, 137 NSE stocks, net of
+# costs, on a survivorship-biased (i.e. flattering) universe.
+st.error(
+    "**Do not trade these signals.** Backtested 2010–2026: this scoring model "
+    "returns **−2.25% CAGR** versus **+9.60%** for a Nifty 50 index fund, with a "
+    "49% drawdown and negative expectancy (−₹36/trade over 920 trades). No "
+    "parameter setting tested was profitable. Run `python backtest.py` to verify. "
+    "Educational use only — not SEBI-registered, not investment advice.",
+    icon="🚨",
+)
+
 with st.sidebar:
     st.markdown("""
     <div style='text-align:center;padding:16px 0 8px'>
@@ -173,16 +242,6 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     st.divider()
 
-    page = st.radio("", [
-        "🏠 Home",
-        "🔍 Screener",
-        "📊 Chart",
-        "💼 Demat Analysis",
-        "⭐ Watchlist",
-        "📔 Trade Journal",
-    ], label_visibility="collapsed")
-
-    st.divider()
     st.session_state.capital = st.number_input(
         "💰 Trading Capital (₹)",
         min_value=1000, max_value=10_000_000,
@@ -190,9 +249,10 @@ with st.sidebar:
     )
     st.caption(f"2% risk = ₹{int(st.session_state.capital*0.02):,} per trade")
     st.divider()
-    st.caption(f"🕐 {datetime.now().strftime('%d %b %Y  %H:%M')}")
-    st.caption("⚠️ Not SEBI-registered. Educational use only.")
-    st.caption(f"⚠️ {MODEL_DISCLAIMER}")
+    # Two slots, filled later. A container renders where it is DECLARED, not
+    # where it is written to, so settings must be declared above the footer.
+    sidebar_settings = st.container()
+    sidebar_footer   = st.container()
 
 
 capital = st.session_state.capital
@@ -432,11 +492,13 @@ if page == "🏠 Home":
 
     # Quick market pulse
     st.markdown("### 📡 Market Pulse")
+    # "NIFTY_MIDCAP_150.NS" returns an empty frame from Yahoo, so the fourth
+    # card silently rendered "Loading..." forever. ^NSEMDCP50 resolves.
     indices = {
         "NIFTY 50":     "^NSEI",
         "NIFTY BANK":   "^NSEBANK",
         "SENSEX":       "^BSESN",
-        "NIFTY MID150": "NIFTY_MIDCAP_150.NS",
+        "NIFTY MIDCAP": "^NSEMDCP50",
     }
     idx_cols = st.columns(4)
     for col, (name, sym) in zip(idx_cols, indices.items()):
@@ -465,21 +527,31 @@ if page == "🏠 Home":
     # Features grid
     st.markdown("### 🚀 What You Can Do")
     f1, f2, f3 = st.columns(3)
+    # These were plain <div> cards — the "Run a scan →" text looked like a link
+    # but nothing was clickable. Each card now carries a real button.
     features = [
-        ("🔍 Screener", "Scan full NSE universe. Algorithm scores every stock 0–100. Filter by sector, RSI, volume.", "Run a scan →"),
-        ("📊 Chart",    "Full trading chart — Candlestick, MAs, Bollinger Bands, MACD, RSI, Volume, Trade Levels.", "View chart →"),
-        ("💼 Demat",    "Upload your CDSL/broker holdings CSV. Get Hold/Exit/Buy-more recommendation for each stock.", "Analyse portfolio →"),
-        ("⭐ Watchlist", "Save stocks you're tracking. One-click refresh of scores and signals.", "View watchlist →"),
-        ("📔 Journal",  "Log every trade with entry/exit/reason. Track P&L and learn from history.", "Open journal →"),
-        ("📐 Position", "Auto-calculates qty to buy based on 2% risk rule and your capital.", "Set in sidebar →"),
+        ("🔍 Screener", "Scan the NSE universe. The algorithm scores every stock 0–100.",
+         "Run a scan", "🔍 Screener"),
+        ("📊 Chart",    "Candlestick, moving averages, Bollinger Bands, MACD, RSI, volume, trade levels.",
+         "View chart", "📊 Chart"),
+        ("💼 Demat",    "Upload your broker holdings CSV. Get a Hold / Exit / Book call on each stock.",
+         "Analyse portfolio", "💼 Demat Analysis"),
+        ("⭐ Watchlist", "Save stocks you're tracking. One-click refresh of scores and signals.",
+         "View watchlist", "⭐ Watchlist"),
+        ("📔 Journal",  "Log every trade with entry, exit and reason. Track P&L and learn from history.",
+         "Open journal", "📔 Trade Journal"),
+        ("📐 Position", "Auto-calculates quantity from the 2% risk rule and your capital.",
+         "Set capital", "🔍 Screener"),
     ]
-    for i, (title, desc, cta) in enumerate(features):
-        col = [f1,f2,f3][i%3]
-        col.markdown(f"""<div class="card" style="height:150px;">
-          <div style="font-size:16px;font-weight:600;margin-bottom:6px">{title}</div>
-          <div style="font-size:12px;color:#8a9ab5;line-height:1.6">{desc}</div>
-          <div style="font-size:11px;color:#3b9eff;margin-top:10px">{cta}</div>
-        </div>""", unsafe_allow_html=True)
+    for i, (title, desc, cta, target) in enumerate(features):
+        col = [f1, f2, f3][i % 3]
+        with col:
+            st.markdown(f"""<div class="card" style="min-height:118px;margin-bottom:4px">
+              <div style="font-size:16px;font-weight:600;margin-bottom:6px">{title}</div>
+              <div style="font-size:12px;color:#8a9ab5;line-height:1.6">{desc}</div>
+            </div>""", unsafe_allow_html=True)
+            st.button(f"{cta} →", key=f"feat_{i}", use_container_width=True,
+                      on_click=goto, args=(target,))
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -515,22 +587,27 @@ if page == "🏠 Home":
 elif page == "🔍 Screener":
     st.markdown("## 🔍 NSE Swing Trade Screener")
 
-    # Settings
-    with st.sidebar:
+    # Settings. Two controls are enough: how much you risk, and how strict you
+    # are. Everything else has a sane default and is tucked away — including the
+    # "Sector Filter", which was collected and then never used by any code path.
+    with sidebar_settings:
         st.markdown("### ⚙️ Scan Settings")
-        min_score    = st.slider("Min Score", 40, 90, MIN_SCORE, 5)
-        universe_sz  = st.selectbox("Universe Size", [200, 500, 1000, 2000], index=1)
-        use_fallback = st.checkbox("Use curated list (faster, offline)", False)
-        st.markdown("**Sector Filter:**")
-        sel_sectors  = st.multiselect("Sectors", ALL_SECTORS[1:], default=ALL_SECTORS[1:],
-                                       label_visibility="collapsed")
-        min_rsi = st.slider("Min RSI", 30, 60, 45)
-        max_rsi = st.slider("Max RSI", 55, 85, 75)
-        min_vol = st.slider("Min Volume Ratio", 0.5, 3.0, 0.8, 0.1)
-        req_liq = st.checkbox("Require ₹2 cr+ daily turnover", True,
-                              help="Excludes stocks you cannot enter or exit "
-                                   "without moving the price.")
-        run_btn = st.button("🚀 Run Full Scan", type="primary", use_container_width=True)
+        st.caption("Capital is set above ⬆️")
+        min_score = st.slider(
+            "Minimum Score", 40, 90, MIN_SCORE, 5,
+            help="Only show stocks scoring at least this. Higher = fewer, "
+                 "stricter picks. Backtested edge at every level: none.")
+        run_btn = st.button("🚀 Run Scan", type="primary", use_container_width=True)
+
+        with st.expander("Advanced"):
+            universe_sz  = st.selectbox("Universe size", [200, 500, 1000, 2000], index=1)
+            use_fallback = st.checkbox("Curated list only (faster)", False)
+            req_liq = st.checkbox("Require ₹2 cr+ daily turnover", True,
+                                  help="Excludes stocks you cannot enter or exit "
+                                       "without moving the price.")
+            min_rsi = st.slider("Min RSI", 30, 60, 45)
+            max_rsi = st.slider("Max RSI", 55, 85, 75)
+            min_vol = st.slider("Min volume ratio", 0.5, 3.0, 0.8, 0.1)
 
     if run_btn:
         with st.spinner("Fetching NSE universe list..."):
@@ -1172,3 +1249,13 @@ elif page == "📔 Trade Journal":
                 df_j.to_csv(index=False),
                 f"journal_{datetime.now().strftime('%d%b%Y')}.csv",
                 "text/csv", use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  SIDEBAR FOOTER (rendered last, pinned below per-page settings)
+# ══════════════════════════════════════════════════════════════
+with sidebar_footer:
+    st.divider()
+    st.caption(f"🕐 {datetime.now().strftime('%d %b %Y  %H:%M')}")
+    st.caption("⚠️ Not SEBI-registered. Educational use only.")
+    st.caption(f"⚠️ {MODEL_DISCLAIMER}")
