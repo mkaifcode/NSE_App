@@ -8,9 +8,12 @@ font = "sans serif"
 [server]
 headless = true
 port = 8501
-enableCORS = false
-enableXsrfProtection = false
-maxUploadSize = 50
+# This app accepts uploads of demat / broker holdings CSVs. Both of these were
+# disabled, which is a cross-site request forgery hole on any publicly
+# reachable deployment (share.streamlit.io, Railway, etc).
+enableCORS = true
+enableXsrfProtection = true
+maxUploadSize = 5
 
 [browser]
 gatherUsageStats = false

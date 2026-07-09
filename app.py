@@ -9,18 +9,28 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-import json, io, os
+import json, io, os, html
 from datetime import datetime, date
 import yfinance as yf
 import warnings
 warnings.filterwarnings("ignore")
 
 from engine import (
-    parallel_scan, get_nse_universe, fetch_ohlcv,
+    parallel_scan, get_nse_universe, fetch_ohlcv, fetch_ohlcv_checked,
     compute_indicators, score_stock, compute_levels,
-    get_signal, analyse_holding,
-    WEIGHTS, MIN_SCORE, ALL_SECTORS, FALLBACK_UNIVERSE
+    get_signal, analyse_holding, position_size, sessions_to_target,
+    DataError, WEIGHTS, MIN_SCORE, ALL_SECTORS, FALLBACK_UNIVERSE,
+    RISK_FRACTION, MODEL_DISCLAIMER, SCAN_PERIOD,
 )
+
+
+def esc(v) -> str:
+    """Escape anything interpolated into an unsafe_allow_html string.
+
+    Symbols and names reach the UI from user-uploaded broker CSVs; without
+    this, a crafted Symbol column injects markup into the page.
+    """
+    return html.escape(str(v), quote=True)
 
 # ══════════════════════════════════════════════════════════════
 #  CONFIG & GLOBAL STYLES
@@ -32,13 +42,33 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#0a0e1a">
-<style>
+# Meta tags go in their own call. Markdown ends a bare-tag HTML block at the
+# first blank line; when <meta> and <style> shared one string, every CSS rule
+# after the first blank line was re-parsed as markdown and rendered as text.
+st.markdown(
+    '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">'
+    '<meta name="mobile-web-app-capable" content="yes">'
+    '<meta name="theme-color" content="#0a0e1a">',
+    unsafe_allow_html=True,
+)
+
+# `<style>` must be the very first character: that makes this a raw-HTML block
+# that markdown passes through verbatim until </style>, blank lines and all.
+st.markdown("""<style>
 /* ── Layout ── */
-#MainMenu, header, footer { visibility: hidden; }
+/* Hide the toolbar and footer, but NOT <header> itself — the sidebar
+   expand arrow lives inside the header, and hiding it left a collapsed
+   sidebar with no way to reopen. */
+#MainMenu { visibility: hidden; }
+footer { visibility: hidden; }
+[data-testid="stToolbar"] { display: none !important; }
+[data-testid="stDecoration"] { display: none !important; }
+header[data-testid="stHeader"] { background: transparent !important; }
+[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="stExpandSidebarButton"] {
+  display: flex !important; visibility: visible !important; z-index: 999;
+}
 .block-container { padding: 1.2rem 1.5rem 2rem !important; }
 @media(max-width:768px){ .block-container{ padding:0.6rem 0.6rem 2rem !important; } }
 
@@ -121,6 +151,7 @@ def ss(key, default):
         st.session_state[key] = default
 
 ss("scan_results",  [])
+ss("scan_stats",    None)
 ss("watchlist",     [])
 ss("journal",       [])
 ss("demat_df",      None)
@@ -161,6 +192,7 @@ with st.sidebar:
     st.divider()
     st.caption(f"🕐 {datetime.now().strftime('%d %b %Y  %H:%M')}")
     st.caption("⚠️ Not SEBI-registered. Educational use only.")
+    st.caption(f"⚠️ {MODEL_DISCLAIMER}")
 
 
 capital = st.session_state.capital
@@ -169,45 +201,58 @@ capital = st.session_state.capital
 # ══════════════════════════════════════════════════════════════
 #  HELPER: full chart for any stock
 # ══════════════════════════════════════════════════════════════
+VIEW_BARS = {"1mo": 22, "3mo": 63, "6mo": 126, "1y": 252, "2y": 10_000}
+
+
 def render_chart(ticker_ns: str, period: str = "6mo"):
+    # Always pull the full history the indicators need, then slice for display.
+    # Fetching only `period` meant a 6-month chart computed a 200-DMA over 126
+    # bars — it came back NaN, so the 200-DMA criterion silently scored zero
+    # and this page disagreed with the Demat page on the very same stock.
     try:
-        df = yf.download(ticker_ns, period=period, interval="1d",
-                         progress=False, auto_adjust=True)
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        df.dropna(inplace=True)
-        if len(df) < 20:
-            st.warning("Not enough data.")
-            return
-    except Exception:
-        st.error("Failed to fetch chart data.")
+        df_full = fetch_ohlcv_checked(ticker_ns, period=SCAN_PERIOD)
+    except DataError as e:
+        st.error(f"Failed to fetch chart data for {esc(ticker_ns)}: {esc(e)}")
         return
 
-    ind       = compute_indicators(df)
+    ind       = compute_indicators(df_full)
     score, bd = score_stock(ind)
     lvl       = compute_levels(ind)
     p         = ind["price"]
-    name      = ticker_ns.replace(".NS","")
+    name      = ticker_ns.replace(".NS", "")
+
+    view = min(VIEW_BARS.get(period, 126), len(df_full))
+    df   = df_full.tail(view)
+    tv   = lambda s: s.tail(view)   # slice an indicator series to the view window
 
     # Header
-    prev  = float(df["Close"].iloc[-2])
+    prev  = float(df_full["Close"].iloc[-2])
     chg1d = ((p - prev) / prev) * 100
     cc    = "#00d26a" if chg1d >= 0 else "#f87171"
     arr   = "▲" if chg1d >= 0 else "▼"
 
+    rng_label = "52W" if ind["full_52w"] else f"{ind['range_window']}D"
+    warn = ""
+    if not ind["liquid"]:
+        warn += f'<div class="badge badge-red">Illiquid — ₹{ind["turnover"]/1e7:.2f} cr/day</div>'
+    if not ind["has_200dma"]:
+        warn += '<div class="badge badge-amber">No 200-DMA — short history</div>'
+
     st.markdown(f"""
     <div class="card" style="padding:14px 20px;">
       <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
-        <div style="font-size:22px;font-weight:700">{name}</div>
+        <div style="font-size:22px;font-weight:700">{esc(name)}</div>
         <div>
           <span style="font-size:26px;font-weight:600">₹{p:.2f}</span>
           <span style="color:{cc};font-size:14px;margin-left:8px">{arr} {abs(chg1d):.2f}%</span>
         </div>
         <div class="badge {'badge-green' if score>=65 else 'badge-amber' if score>=55 else 'badge-red'}">
-          Score {score}/100 — {get_signal(score).split(' ',1)[1]}
+          Score {score}/100 — {esc(get_signal(score, ind).split(' ',1)[1])}
         </div>
         <div style="color:#6b7a99;font-size:12px">
-          52W: ₹{ind['low_52w']:.0f} – ₹{ind['high_52w']:.0f}
+          {rng_label}: ₹{ind['low_52w']:.0f} – ₹{ind['high_52w']:.0f}
         </div>
+        {warn}
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -252,17 +297,17 @@ def render_chart(ticker_ns: str, period: str = "6mo"):
         (ind["_sma50"],  "50 SMA",  "#3b9eff", 1.5, "solid"),
         (ind["_ema9"],   "9 EMA",   "#a78bfa", 1.0, "dot"),
     ]:
-        fig.add_trace(go.Scatter(x=df.index, y=series, name=name_s,
+        fig.add_trace(go.Scatter(x=df.index, y=tv(series), name=name_s,
             line=dict(color=color, width=width, dash=dash)), row=1, col=1)
 
     if ind["sma200"] is not None:
-        fig.add_trace(go.Scatter(x=df.index, y=ind["_sma200"], name="200 SMA",
+        fig.add_trace(go.Scatter(x=df.index, y=tv(ind["_sma200"]), name="200 SMA",
             line=dict(color="#f87171", width=1.5)), row=1, col=1)
 
     # Bollinger Bands
-    fig.add_trace(go.Scatter(x=df.index, y=ind["_bb_upper"], name="BB Upper",
+    fig.add_trace(go.Scatter(x=df.index, y=tv(ind["_bb_upper"]), name="BB Upper",
         line=dict(color="rgba(59,158,255,0.3)", width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=ind["_bb_lower"], name="BB Lower",
+    fig.add_trace(go.Scatter(x=df.index, y=tv(ind["_bb_lower"]), name="BB Lower",
         line=dict(color="rgba(59,158,255,0.3)", width=1),
         fill="tonexty", fillcolor="rgba(59,158,255,0.04)"), row=1, col=1)
 
@@ -283,20 +328,21 @@ def render_chart(ticker_ns: str, period: str = "6mo"):
              for c,o in zip(df["Close"], df["Open"])]
     fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume",
         marker_color=vcols, opacity=0.6), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=ind["_avg_vol_20"],
+    fig.add_trace(go.Scatter(x=df.index, y=tv(ind["_avg_vol_20"]),
         name="Vol MA20", line=dict(color="#f59e0b", width=1)), row=2, col=1)
 
     # MACD
-    hcols = ["#00d26a" if v >= 0 else "#f87171" for v in ind["_macd_h"]]
-    fig.add_trace(go.Bar(x=df.index, y=ind["_macd_h"], name="MACD Hist",
+    macd_h = tv(ind["_macd_h"])
+    hcols  = ["#00d26a" if v >= 0 else "#f87171" for v in macd_h]
+    fig.add_trace(go.Bar(x=df.index, y=macd_h, name="MACD Hist",
         marker_color=hcols, opacity=0.7), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=ind["_macd_l"], name="MACD",
+    fig.add_trace(go.Scatter(x=df.index, y=tv(ind["_macd_l"]), name="MACD",
         line=dict(color="#3b9eff", width=1.5)), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=ind["_macd_s"], name="Signal",
+    fig.add_trace(go.Scatter(x=df.index, y=tv(ind["_macd_s"]), name="Signal",
         line=dict(color="#f59e0b", width=1.2)), row=3, col=1)
 
     # RSI
-    fig.add_trace(go.Scatter(x=df.index, y=ind["_rsi"], name="RSI",
+    fig.add_trace(go.Scatter(x=df.index, y=tv(ind["_rsi"]), name="RSI",
         line=dict(color="#a78bfa", width=1.5)), row=4, col=1)
     fig.add_hrect(y0=50, y1=65, fillcolor="rgba(0,210,106,0.05)",
                   line_width=0, row=4, col=1)
@@ -324,10 +370,16 @@ def render_chart(ticker_ns: str, period: str = "6mo"):
     col_bd, col_lv = st.columns(2)
     with col_bd:
         st.markdown("#### 🎯 Score Breakdown")
+        # A factor scored None was not applicable (e.g. no 200-DMA yet). It is
+        # excluded from the denominator, so it must not be drawn as a zero.
+        skipped = [k for k, v in bd.items() if v is None]
         bd_df = pd.DataFrame([{
             "Criterion": k.replace("_"," ").title(),
             "Earned": v, "Max": WEIGHTS[k],
-        } for k, v in bd.items()])
+        } for k, v in bd.items() if v is not None])
+        if skipped:
+            st.caption("Not scored (insufficient history): "
+                       + ", ".join(k.replace("_", " ") for k in skipped))
         fig_bd = px.bar(bd_df, x="Earned", y="Criterion", orientation="h",
                         color="Earned", color_continuous_scale="RdYlGn",
                         range_color=[0,20],
@@ -342,8 +394,11 @@ def render_chart(ticker_ns: str, period: str = "6mo"):
 
     with col_lv:
         st.markdown("#### 📐 Trade Plan")
-        qty = int((capital * 0.02) / max(p - lvl["sl"], 0.5))
+        qty = position_size(capital, p, lvl["sl"])
         req = round(qty * p, 0)
+        if qty == 0:
+            st.warning("Position size is 0 — the 2% risk budget cannot buy even "
+                       "one share at this stop distance. Reduce risk or skip.")
         st.markdown(f"""
 <div class="card">
 <table style="width:100%;font-size:13px;border-collapse:collapse;">
@@ -472,6 +527,9 @@ elif page == "🔍 Screener":
         min_rsi = st.slider("Min RSI", 30, 60, 45)
         max_rsi = st.slider("Max RSI", 55, 85, 75)
         min_vol = st.slider("Min Volume Ratio", 0.5, 3.0, 0.8, 0.1)
+        req_liq = st.checkbox("Require ₹2 cr+ daily turnover", True,
+                              help="Excludes stocks you cannot enter or exit "
+                                   "without moving the price.")
         run_btn = st.button("🚀 Run Full Scan", type="primary", use_container_width=True)
 
     if run_btn:
@@ -485,11 +543,25 @@ elif page == "🔍 Screener":
         def cb(done, total):
             pb.progress(done/total, text=f"Scanning... {done}/{total}")
 
-        results = parallel_scan(universe, max_workers=20, progress_cb=cb)
-        pb.progress(1.0, text=f"✅ Done! {len(universe)} stocks scanned.")
+        results, scan_stats = parallel_scan(universe, max_workers=8,
+                                            progress_cb=cb, require_liquid=req_liq)
+        pb.progress(1.0, text=f"✅ Done — usable data for {scan_stats['succeeded']} "
+                              f"of {scan_stats['requested']} stocks.")
         st.session_state.scan_results = results
+        st.session_state.scan_stats   = scan_stats
 
-    results = st.session_state.scan_results
+    results    = st.session_state.scan_results
+    scan_stats = st.session_state.get("scan_stats")
+
+    # A scan where most tickers were rate-limited used to render a clean, short
+    # table that looked exactly like a complete one. Say what was actually fetched.
+    if scan_stats and scan_stats["failed"]:
+        pct = scan_stats["succeeded"] / max(scan_stats["requested"], 1) * 100
+        detail = ", ".join(f"{v}× {esc(k)}" for k, v in
+                           sorted(scan_stats["reasons"].items(), key=lambda x: -x[1])[:4])
+        msg = (f"Scanned {scan_stats['succeeded']}/{scan_stats['requested']} "
+               f"({pct:.0f}%). Skipped {scan_stats['failed']}: {detail}.")
+        (st.warning if pct < 80 else st.info)(msg)
     if not results:
         st.markdown("""<div class="card" style="text-align:center;padding:40px">
           <div style="font-size:36px">🔍</div>
@@ -560,14 +632,17 @@ elif page == "🔍 Screener":
         else:
             df_show = df_fil.copy()
             df_show["Qty"]   = df_show.apply(
-                lambda r: int((capital*0.02)/max(r["price"]-r["sl"],0.5)), axis=1)
+                lambda r: position_size(capital, r["price"], r["sl"]), axis=1)
             df_show[">50D"]  = df_show["above_50"].map({True:"✅",False:"❌"})
-            df_show[">200D"] = df_show["above_200"].map({True:"✅",False:"❌"})
+            # "—" not "❌": no 200-DMA means unknown, not below it.
+            df_show[">200D"] = df_show.apply(
+                lambda r: ("✅" if r["above_200"] else "❌") if r["has_200"] else "—", axis=1)
 
             show_cols = {
                 "name":"Stock","price":"CMP ₹","score":"Score","signal_s":"Signal",
                 "rsi":"RSI","vol_ratio":"Vol×","chg_5d":"5D%","chg_20d":"20D%",
                 ">50D":">50D",">200D":">200D",
+                "turnover_cr":"₹cr/day",
                 "sl":"SL ₹","t1":"T1 ₹","t2":"T2 ₹",
                 "rr":"R/R","risk_pct":"Risk%","Qty":"Qty(2%)",
                 "from_52h":"52H%",
@@ -770,6 +845,17 @@ Login at myeasi.cdsl.com → Holdings → Download
 
         analyses = st.session_state.demat_analysis
         valid    = [a for a in analyses if not a.get("error")]
+        broken   = [a for a in analyses if a.get("error")]
+
+        if broken:
+            # These rows are missing from every total below. Say so — a silently
+            # dropped holding makes the portfolio P&L quietly wrong.
+            st.warning(
+                f"No data for {len(broken)} holding(s); they are excluded from all "
+                "totals below: "
+                + ", ".join(f"{esc(a['symbol'])} ({esc(a.get('msg','unknown'))})"
+                            for a in broken)
+            )
 
         if not valid:
             st.error("Could not fetch data for any holdings. Check symbols and internet connection.")
@@ -839,7 +925,7 @@ Login at myeasi.cdsl.com → Holdings → Download
 <div class="hold-card">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
     <div>
-      <span style="font-size:17px;font-weight:700">{a['symbol']}</span>
+      <span style="font-size:17px;font-weight:700">{esc(a['symbol'])}</span>
       <span style="margin-left:10px;font-size:12px;color:#6b7a99">{a['qty']} shares @ ₹{a['avg_price']}</span>
     </div>
     <div style="text-align:right">
@@ -861,11 +947,13 @@ Login at myeasi.cdsl.com → Holdings → Download
     <div><span style="color:#6b7a99;font-size:11px">>50 DMA</span><br>
          <span style="font-size:13px">{'✅' if a['above_50'] else '❌'}</span></div>
     <div><span style="color:#6b7a99;font-size:11px">>200 DMA</span><br>
-         <span style="font-size:13px">{'✅' if a['above_200'] else '❌'}</span></div>
+         <span style="font-size:13px">{('✅' if a['above_200'] else '❌') if a['has_200'] else '—'}</span></div>
+    <div><span style="color:#6b7a99;font-size:11px">R/R</span><br>
+         <span style="font-size:13px">{a['rr']}×</span></div>
   </div>
   <div style="background:#0a0e1a;border-radius:8px;padding:10px 14px;border-left:3px solid {action_col}">
-    <div style="color:{action_col};font-weight:600;font-size:13px">{a['action']}</div>
-    <div style="color:#8a9ab5;font-size:12px;margin-top:3px">{a['reason']}</div>
+    <div style="color:{action_col};font-weight:600;font-size:13px">{esc(a['action'])}</div>
+    <div style="color:#8a9ab5;font-size:12px;margin-top:3px">{esc(a['reason'])}</div>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -925,8 +1013,13 @@ elif page == "⭐ Watchlist":
     else:
         if st.button("🔄 Refresh All Signals", type="primary"):
             with st.spinner("Fetching live data..."):
-                wl_results = parallel_scan(st.session_state.watchlist, max_workers=10)
+                # require_liquid=False: the user explicitly chose to track these.
+                wl_results, wl_stats = parallel_scan(
+                    st.session_state.watchlist, max_workers=6, require_liquid=False)
                 st.session_state.wl_data = wl_results
+                if wl_stats["failed"]:
+                    st.warning(f"No data for {wl_stats['failed']} of "
+                               f"{wl_stats['requested']} watchlist symbols.")
 
         wl_data = st.session_state.get("wl_data", [])
         if not wl_data:
